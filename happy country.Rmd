@@ -1,0 +1,1598 @@
+---
+title: "What makes a happy country? A large computational search suggests a new model and mechanism for 
+national satisfaction"
+author: |
+    | Alexander Loewi^[Dovecote Institute, US Treasury, USA, E-mail: \texttt{aloewi@dovecoteinstitute.org}]
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+tags: ["life satisfaction", "World Happiness Report", "SDO", "RWA", "democracy", "authoritarianism"]
+abstract:
+    "To improve human wellbeing, we must understand what drives it. Life satisfaction data have been collected internationally since 2005, but without a rigorous model of what drives these outcomes, it has remained difficult to draw policy lessons. We fill this gap by aggregating life satisfaction data with nation-level data on an unprecedented number of potential drivers (n=5,533). We use the Lasso, a computational method for variable selection, to construct a simple but highly accurate model with low risk of omitted variables or human selection bias. We show this model has higher prediction accuracy than the current world standard from the United Nations, and the variables it selects are more consistent with studies from political science, social psychology, and other fields. It also selects many variables the current standard does not, including LGBTQ+ acceptance, gender equity, and accessible political power. Unlike the current standard, which suggests GDP determines 40% of a nation’s satisfaction, our model estimates GDP’s independent contribution at 1.5%. We also find few of the variables hypothesized by recent Nobel-awarded economics work. Finally, we show that our model is more consistent with theories of anti-authoritarian psychology than with “institutions” as a driver of national outcomes. These findings allow policy makers and advocates to prioritize higher-impact goals. It also reveals that current actions in countries across the world directly oppose predictors of satisfaction. In the face of severe global crises, including failure to keep global warming below the “red line”  1.5C, and a rise in authoritarianism, we need far greater clarity about the future we desire as a society, and how to achieve it. As theories compete on the world stage, often violently, our model offers a simple, empirically driven message to cut through the fog: if we are to improve universal human wellbeing, there is no option but to empower individuals who desire that improvement."
+    
+output: 
+    bookdown::pdf_document2:
+        fig_caption: yes
+        toc: no
+bibliography: "/Users/amloewi/Code/tmip/whr saved/whr.bib"
+csl: nature.csl
+# csl: wlscirep.csl
+bib-latex-options: "style=apa"
+# classoptions: 
+#   # - sn-basic      
+#   - Numbered
+header-includes:
+    - \usepackage{float}
+    - \usepackage{lineno} 
+    - \usepackage[numbers]{natbib}
+    # - \usepackage{mathtools}
+    # - \usepackage[style=numeric]{biblatex}
+---
+
+```{r include=FALSE}
+# automatically create a bib database for R packages
+knitr::write_bib(c(
+  .packages(), 'knitr', 'rmarkdown'
+), 'packages.bib')
+```
+
+    
+```{r setup, include=FALSE}
+library(knitr)
+library(rticles)
+library(DAAG)
+library(texreg)
+library(ggplot2)
+library(latex2exp)
+library(data.table)
+library(missForest)
+library(lmtest)
+library(sandwich)
+library(RColorBrewer)
+library(latex2exp)
+library(knitcitations)
+setwd("/Users/amloewi/Code/tmip/whr saved")
+# setwd("/code and data") # SET TO CORRECT WORKING DIRECTORY TO RUN
+knitr::opts_chunk$set(echo=FALSE, cache = F, warning = F)
+# knitr::opts_knit$set(root.dir = "root.dir") # SET TO CORRECT WORKING DIRECTORY TO RUN
+knitr::opts_knit$set(root.dir = "/Users/amloewi/Code/tmip/whr saved")
+```
+
+<!-- All the critical functions -->
+```{r functions, include=FALSE}
+####################
+##### FUNCTIONS ####
+####################
+
+syn_path <- "country_synonym_table.csv"
+syn <- read.csv(syn_path, stringsAsFactors = F)
+
+print_fit <- function(m, df) {
+    s <- summary(m)
+    cve <- attr(cv.lm(df, m, printit=F, plotit=F), 'ms')
+    out <- paste0(
+        "R^2=", round(s$adj.r.squared, 3),
+        ", RSE=", round(sigma(m), 3),
+        ", CVE=", round(sqrt(cve), 3)
+    )
+    return(out)
+}
+
+fill_left <- function(x) {
+    ix <- which(x==1)
+    if (length(ix) > 0) {
+        return(rep(c(1, 0), times=c(ix, length(x)-ix)))
+    } else {
+        return(rep(0, length(x)))
+    }
+}
+
+lm_to_bx <- function(m, absolute.value=FALSE, df=NULL) {
+    
+    if (is.null(df)) {
+        ct <- coeftest(m, vcov = vcovHC(m, "HC1"))   # HC1 gives us the White standard errors
+    } else {
+        ct <- coeftest(m, vcov = vcovCL(m, "HC1", cluster=df$country))
+    }
+    
+    if (length(grep("year_effect", names(m$coefficients))) > 0) {
+        means <- colMeans(m$model[, -grep("year_effect", names(m$model))]) 
+        coefs <- m$coefficients[-grep("year_effect", names(m$coefficients))]
+        s <- summary(m)
+        pvals <- ct[, 4][-grep("year_effect", names(s$coefficients[, 4]))]
+        se <- ct[, 2][-grep("year_effect", names(s$coefficients[, 2]))]        
+    } else {
+        means <- colMeans(m$model)
+        coefs <- m$coefficients
+        pvals <- ct[, 4]
+        se <- ct[, 2]        
+    }
+    
+    # SECOND PART OF absolute.value
+    if (absolute.value) {
+        coefs <- abs(coefs)
+    }
+    
+    means[1] <- 1 # for the intercept
+    bx <- means * coefs
+    df <- data.frame(bx) 
+    rownames(df)[1] <- "(Intercept)"
+    df$variable <- rownames(df)
+    
+    df$pval <- pvals
+    df$bse <- means * se
+    
+    return(df)
+}
+
+
+pval_to_color <- function(x, cutoffs) {
+    ix <- c()
+    for (z in x) {
+        out <- sum(z < cutoffs) + 1 # +1 b/c 0 won't index
+        ix <- c(ix, out)
+    }
+    return(ix)
+}
+
+
+plot_bx_groups <- function(m, groups=NULL, names=NULL, absolute.value=F,
+                           title="", subtitle="", palette="Paired",
+                           levels=NULL, clusters=NULL) { # }, colors) {
+    
+    bx <- lm_to_bx(m, absolute.value, df=clusters) 
+    
+    if (is.null(groups)) {
+        groups <- as.list(names(coef(m))[-1])
+        names <- unlist(groups)
+    }
+    
+    bx$group <- 0
+    for (i in 1:nrow(bx)) {
+        for (j in 1:length(groups)) {
+            if (bx$variable[i] %in% groups[[j]])
+                bx$group[i] <- j # saves 0 for NO affiliation; necessary for the intercept, and long tail
+        }
+    }
+    dt <- data.table(bx[bx$group!=0, ])
+    
+    dt <- dt[, list(bx=sum(bx), pval=min(pval), # 'min' just takes one; all the same values, by=group
+                    bse=min(bse)), by=group] # => c(group, bx)
+    
+    # The names come out of here scrambled, so have to re-index them when collating
+    names <- names[dt$group]
+    if (is.null(levels)) {
+        levels <- names[order(dt$bx)] 
+    } 
+    dt$name <- factor(names, levels=levels)
+    dt$group <- as.factor(dt$group)
+    
+    # 
+    dt$whisker.min <- dt$bx - 1.96*dt$bse
+    dt$whisker.max <- dt$bx + 1.96*dt$bse        
+    #
+    
+    cutoffs <- c(.001, .01, .05, .1, .25, .5) # 0, implicitly
+    # coul <- c("orange", "yellow", "lightgrey", "lightblue", "skyblue", "blue", "navy")
+    coul <- c("lightgrey", "lightgrey", "lightgrey", "lightblue", "skyblue", "blue", "navy")
+    names(coul) <- rev(cutoffs)
+    
+    color_by_significance <- TRUE
+    # 'coul' is just a vector of hex codes from light to dark
+    if (color_by_significance) {
+        coul <- colorRampPalette(coul)(length(cutoffs)+1) # nrow(dt))
+        dt$significance <- pval_to_color(dt$pval, cutoffs)
+    } else {
+        # Currently, no way to NOT plot by significance; but, that's ok
+        coul <- colorRampPalette(coul)(nrow(dt))
+    }
+    p <- ggplot(dt, aes(x=name, y=bx, fill=group)) + # the 'group' numbers are different
+        scale_fill_manual(values=coul[dt$significance]) +
+        geom_bar(stat = "identity", show.legend=F) +
+        geom_errorbar(aes(ymin = whisker.min, ymax = whisker.max), 
+                      lwd = 0.25, show.legend = FALSE) + 
+        labs(title = title, subtitle = subtitle) +
+        coord_flip() +
+        ylab(TeX("$\\hat{\\beta} \\cdot \\bar{x}$")) + 
+        xlab("")
+    
+    return (p)
+}
+
+plot_bx <- function(m, intercept=F, width=12) {
+    bx <- lm_to_bx(m)
+    bx <- bx[order(bx$bx), ]
+    if (intercept) {
+    } else {
+        bx <- bx[bx$variable!="(Intercept)", ]
+    }
+    par(mar=c(5, width, 2, 2))
+    barplot(bx$bx, names.arg = bx$variable, las=1, horiz=T) 
+}
+
+na_plot <- function(df) {
+    variables <- c()
+    missingness <- seq(0, 1, by=0.05)
+    for (i in missingness) {
+        pct <- sum(colMeans(is.na(df)) < i)
+        variables <- c(variables, pct)
+    }
+    plot(variables ~ missingness)
+}
+```
+
+# Introduction
+When attempting to be successful in any endeavor, 
+there is no more fundamental step than defining that success. In the United States,
+the Declaration of Independence proposes indirectly that success be defined as 
+"life, liberty, and the pursuit of 
+happiness" -- but concretely, rigorously measured versions of these criteria are
+rarely discussed. Posed in all seriousness, a simple question does not return an easy
+answer: What exactly is our country attempting to achieve? Or more grandly,
+What do we want out of life?
+    
+At a policy level, the most frequently used quantitative objective is economic productivity,
+measured by Gross Domestic Product (GDP), despite the fact that the measure's own creator cautioned against using it for such a purpose [@Kuznets]. Since its creation, generations
+of economists including prominent Nobelists have pointed out GDP's fundamental shortcomings as a national guide, and international working groups of leading researchers have been established to find alternatives.
+
+From out of these efforts, the single-measure objective that has been most accepted as a meaningful policy goal is subjective life satisfaction [@WellBeing].
+Unlike "happiness," or "positive affect," which typically refer to a necessarily
+short-lived emotional state, "satisfaction" in the literature refers to a 
+cognitive judgment about the respondent's overall satisfaction with the totality of
+their life. Most commonly, this is measured with Diener's Satisfaction With
+Life Survey (SWLS) [@SWLS] or the Cantril Ladder [@Cantril], which take a similar approach.
+While refinements continue to be made [@GFS, @LadderBad], a large body of research has demonstrated these measures are stable, meaningful, intuitive, valid, and largely comparable across languages, countries, and cultures [@WellBeing].
+
+Following these findings, the consulting 
+firm Gallup Inc. has included questions on self-reported life satisfaction
+in its World Poll since 2005. This survey uses the Cantril ladder, or life ladder,
+which asks the following question: 
+
+“Please imagine a ladder, with steps numbered from 0 at the bottom to 10 at the top. The top of the ladder represents the best possible life for you and the bottom of the ladder
+represents the worst possible life for you. On which step of the ladder would you say you personally feel you stand at this time?”
+
+Since 2012, these results on satisfaction 
+have been the central reported substance of the World Happiness Report (WHR) [@WHR].
+This report is released in collaboration with the United Nation's Sustainable Development Solutions Network, and Oxford University.
+
+The WHR is now the world's best known and most widely distributed source of
+information on global satisfaction. At the center of this report is the
+WHR's six-variable model of satisfaction, which uses hand-picked variables
+in a linear regression to model national-level satisfaction outcomes.
+
+This model is critical to the report because knowing how to improve is arguably even more
+important than measuring where we currently stand. By claiming 
+to "explain" national outcomes (the word used by the WHR), the model suggests a policy path towards a better world. However, this flagship model immediately raises concerns. The list of six variables
+is short, limited in its contents, and given almost no justification.
+
+In light of this concern, and the extreme importance of the conclusions, 
+this paper attempts to re-estimate the model of global life satisfaction.
+Responding to the perceived shortcomings of the current standard, the twin objectives of this paper are to cast as broad a net as possible for factors that may be missing, and to select from those factors in as objective and data-driven a manner as possible. 
+
+The results obtained are measurably more accurate, more consistent with the published literature, prima facie more plausible, and differ markedly in substance from those reported by the WHR.
+
+# Results
+
+<!-- Caret glmnet on the data, to find optimal parameters -->
+<!-- Not run b/c it's SLOW; parameters are extracted and saved -->
+```{r, include=F, eval=F}
+library(glmnet)
+library(caret)
+lambda.grid <- exp(seq(-4, -1, length=20)) 
+alpha.grid <- 1 
+search_grid <- expand.grid(.alpha = alpha.grid, .lambda = lambda.grid)
+
+train_control = trainControl(method = "repeatedcv", repeats=5)
+
+caret.results <- train(x = df[, -1], 
+                       y = df[,  1], 
+                       method = "glmnet",
+                       tuneGrid = search_grid,
+                       trControl = train_control)
+plot(caret.results) 
+
+g <- glmnet(x = df[, -1], 
+            y = df[,  1], 
+            alpha=1,
+            lambda=exp(-2.5))
+coefs <- coef(g)
+best <- rownames(coefs)[as.vector(abs(coefs) > 0)][-1]
+length(best)
+```
+
+
+## The Model
+
+The main result of this paper is the model of nation-level life satisfaction.
+This will be referred to as the Dovecote model. 
+
+<!-- Curated Model -->
+```{r m_curated}
+df11 <- read.csv("~/Code/tmip/whr saved/code and data/df11 imputed 5-7.csv",
+                 stringsAsFactors = F)
+df11$year_effect <- as.character(df11$year)
+m11_100 <- lm(Life.Ladder ~
+                  year_effect
+    + e_pelifeex
+    + Freedom.to.make.life.choices
+    + sdg_GNI.per.capita..US..
+    + sdg_Urban.population....of.total.population.
+    + sipri_percap
+    + Social.support
+    + spi_Acceptance.of.gays.and.lesbians...proportion.of.pop..
+    + spi_Access.to.electricity.....of.pop..
+    + spi_Satisfaction.with.water.quality..proportion.of.pop..
+    + v2elpubfin
+    + wb_unemployment    
+    + v2exctlhs_0
+    + sdg_Compulsory.education..duration..years.
+    + spilong_Internet.users....of.pop..        
+    + v2exctlhs_2
+    + v2lgfunds
+    + v2elsnmrfc_16
+    + sdg_Employment.in.services..female....of.female.employment...modeled.ILO.estimate.     
+    + spi_Intimate.Partner.Violence....of.women.aged.15..  
+, data=df11)
+# nolog: "R^2=0.818, RSE=0.482, CVE=0.487"
+#   log: "R^2=0.818, RSE=0.483, CVE=0.489"
+```
+
+
+```{r mbx, fig.cap="Contributions of the Dovecote Model", fig.align = "center", fig.show="hold", out.width="90%"} 
+plot_bx_groups(m11_100,
+               clusters=df11,
+               groups=c(
+    "e_pelifeex",
+    "Freedom.to.make.life.choices",
+    "sdg_GNI.per.capita..US..",
+    "sdg_Urban.population....of.total.population.",
+    "sipri_percap",
+    "Social.support",
+    "spi_Acceptance.of.gays.and.lesbians...proportion.of.pop..",
+    "spi_Access.to.electricity.....of.pop..",
+    "spi_Satisfaction.with.water.quality..proportion.of.pop..",
+    "v2elpubfin",
+    "wb_unemployment",
+    "v2exctlhs_0",
+    "sdg_Compulsory.education..duration..years.",
+    "spilong_Internet.users....of.pop..",
+    "v2exctlhs_2",
+    "v2lgfunds",
+    "v2elsnmrfc_16",
+    "sdg_Employment.in.services..female....of.female.employment...modeled.ILO.estimate.",
+    "spi_Intimate.Partner.Violence....of.women.aged.15.."
+               ),
+               names=c(
+                   "Life Expectancy"
+                   , "Feelings of Freedom"
+                   , "GNI per capita"
+                   , "People in Cities"        
+                   , "Military Spending"
+                   , "Strong Relationships"   
+                   , "LGBTQ+ Acceptance"
+                   , "Access to Electricity"
+                   , "Clean Water"
+                   , "Public Campaign Financing"
+                   , "Unemployment" 
+                   , "No Shadow Governance" 
+                   , "Compulsory Education"
+                   , "Internet Users"
+                   , "Party Shadow Governance"
+                   , "Legislative Independence"
+                   , "Election Interference"
+                   , "Women in White Collar Jobs" 
+                   , "Intimate Partner Violence"
+               )
+) 
+# print_fit(m11_100, df11)
+```
+
+
+<!-- eval=F because I use this, but I make manual changes to the results of print() -->
+```{r m_curated_summary, results='asis', eval=F}
+library(lmtest)
+ct <- coeftest(m11_100, vcov = vcovCL(m11_100, 
+                                      "HC1",  # HC1 gives us the White standard errors
+                                      cluster=df11$country))  
+print(texreg(ct)) # , ct_short)))
+```
+
+## Variables
+
+A full list of all tested covariates is not feasible given the scope of the search. For every variable used in the main model, a detailed description is included in the appendix.
+
+
+## Format and interpretation of the reported results
+
+While the estimated coefficients and fit statistics are included in the WHR,
+the report typically gives more space to presenting not the regression 
+coefficients $\hat{\beta}_i$ but rather, to use the WHR's language, the "contribution" of each variable in each country, or $\hat{\beta}_i \bar{x}_{ij}$. This in turn is referred to as the portion 
+of a country's satisfaction "explained by" each variable. These have the valuable
+quality that when added together, the contributions sum to the average
+individual's satisfaction in that country.
+For ease of comparison and interpretation, the same convention is followed here, 
+but using global averages instead of national ones for simplicity of presentation.
+This means the components of the Dovecote model sum to the average satisfaction of the average country.
+
+For an interpretation of these contributions, 1.5 points on the 11-point 
+satisfaction scale can be considered as equal to the full impact of a personal tragedy.
+It is approximately equal to the average measured drop in 
+life satisfaction for an individual between the beginning of the decline, 
+and the final experience, of the death of a life partner [@PartnerDeath]. 
+
+In other words, while the individual may (and may not) rebuild their life in
+the wake of this loss, the average 
+studied individual had dropped approximately 1.5 points at the time of the
+actual death. For those who do recover, it still takes an average of five years from this low point
+to fully recover to the initial level of satisfaction -- a measurement
+on average first taken ten fully years earlier, at the beginning of the partner's
+decline. 
+(Should this seem small, it serves as a valuable reminder that the scale of 0 to 10 is
+designed to encompass the entirety of human experience. It also helps to explain the
+frequent misconception that satisfaction is immutable, by suggesting that
+laboratory-scale interventions are almost invariably insufficient to induce measurable change.)
+
+Thus while a 0.15 point drop in 
+national satisfaction may look small as a number, it can be interpreted
+as 1 in 10 people living a life that is worse by the magnitude of a full-blown tragedy. 
+Thus even small numbers can be significant from a behavioral
+perspective, both in the intensity and duration of effects.
+
+Following the WHR's format for reporting, Figure \ref{fig:mbx} displays
+the average contribution of each variable in the Dovecote model to the predictions. Bars are colored
+by significance level, where navy indicates significance at the .001 level,
+dark blue at the .01 level, sky blue at the .05 level, and light blue at the .10 level.
+As with other technical details, the WHR's conventions are used for significance levels
+and standard errors, which are clustered by country. Error bars represent
+95% confidence intervals on the contributions, calculated as $\hat{\beta}_i \bar{x}_{i} \pm 1.96\cdot\hat{\sigma}_i\bar{x}_i$
+    
+When reading this table it is important to remember that the variables 
+were selected not primarily for their significance, but for their ability to
+predict satisfaction in an out-of-sample model, as selected by an L1-penalized regression, the Lasso.
+It is also the case that allowing multiple 
+variables on a similar phenomenon is seen to dilute their significance.
+For example, the variable on No Shadow Governance is not significant in the 19-variable
+model. However when the (significant) variable on Party Shadow Governance is removed,
+No Shadow Governance becomes strongly significant. In addition, variables on survival phenomena as basic as life expectancy and clean water, while chosen invariably by the search procedure and in the case of life expectancy, also included in the WHR, do not show any statistical significance. In other 
+words, traditional significance levels to not appear to be a reliable signal of variable importance
+with this data - and we furthermore find that most show a substantially lowered p-value when using data back to 2005. Several, including People in cities and Compulsory education, become significant. (The choice of time period is based on which of the significant variables are available, and is discussed further in the section on The Data.)
+
+
+<!-- For comparison's sake, the same specification run on data from 2005+ -->
+```{r m05, fig.cap="Contributions of a Model Using Data Back to 2005", fig.align="center", out.width="100%", fig.show="hold", eval=F}
+df05 <- read.csv("~/Code/tmip/whr saved/code and data/df05 imputed 5-24.csv")
+df05$year_effect <- as.character(df05$year)
+
+m05 <- lm(Life.Ladder ~
+    year_effect
+    + e_pelifeex
+    + Freedom.to.make.life.choices
+    + sdg_GNI.per.capita..US..
+    + sdg_Urban.population....of.total.population.
+    + Social.support
+    + spi_Access.to.electricity.....of.pop..
+    + spi_Satisfaction.with.water.quality..proportion.of.pop..
+    + v2elpubfin
+    + wb_unemployment    
+    + sdg_Compulsory.education..duration..years.
+    + v2exctlhs_2
+    + sdg_Employment.in.services..female....of.female.employment...modeled.ILO.estimate.     
+    + spi_Intimate.Partner.Violence....of.women.aged.15.. 
+    + sipri_percap
+    + v2exctlhs_0
+    + spilong_Internet.users....of.pop..
+    + v2lgfunds
+    + v2elsnmrfc_16
+, data=df05)
+
+plot_bx_groups(m05,
+               clusters=df05,
+               groups=c(
+    "e_pelifeex"
+    , "Freedom.to.make.life.choices"
+    , "sdg_GNI.per.capita..US.."
+    , "sdg_Urban.population....of.total.population."
+    , "Social.support"
+    , "spi_Access.to.electricity.....of.pop.."
+    , "spi_Satisfaction.with.water.quality..proportion.of.pop.."
+    , "v2elpubfin"
+    , "wb_unemployment"
+    , "sdg_Compulsory.education..duration..years."
+    , "v2exctlhs_2"
+    , "sdg_Employment.in.services..female....of.female.employment...modeled.ILO.estimate."
+    , "spi_Intimate.Partner.Violence....of.women.aged.15.."
+    , "sipri_percap"
+    , "v2exctlhs_0"
+    , "spilong_Internet.users....of.pop.."
+    , "v2lgfunds"
+    , "v2elsnmrfc_16"
+               ),
+               names=c(
+                   "Life Expectancy"
+                   , "Feelings of Freedom"
+                   , "GNI per capita"
+                   , "People in Cities"        
+                   , "Strong Relationships"   
+                   , "Access to Electricity"
+                   , "Clean Water"
+                   , "Public Campaign Financing"
+                   , "Unemployment" 
+                   , "Compulsory Education"
+                   , "Party Shadow Governance"
+                   , "Women in White Collar Jobs" 
+                   , "Intimate Partner Violence"
+                   , "Military Spending"
+                   , "No Shadow Governance"
+                   , "Internet Users"
+                   , "Legislative Independence"
+                   , "Gov Interferes in Elections"
+               )
+)
+```
+
+
+## Comparison with the WHR's hand-picked model
+
+A comparison of the WHR and Dovecote models can be seen in Table \ref{table:model_comparison}.
+
+```{r model_comparison, eval=T, include=F}
+dfwhr <- read.csv("m_reprod data +country.csv", stringsAsFactors = F) 
+dfwhr$year_effect <- as.character(dfwhr$year)
+m_whr <- lm(Life.Ladder ~
+                year_effect
+                + Social.support
+                + Healthy.life.expectancy.at.birth
+                + Freedom.to.make.life.choices
+                + exp(Log.GDP.per.capita) # log: 76/55/55; bx=3.3!  exp: 74/57/58; bx=0.28!
+                + Perceptions.of.corruption
+                + Generosity
+                ,
+                data=dfwhr)
+# lm_to_bx(m_whr, F, df=dfwhr)
+ct_whr <- coeftest(m_whr, vcov = vcovCL(m_whr, "HC1",
+                                        cluster=dfwhr$country))
+
+# This is used to produce the table, but the output is edited manually
+# print(texreg(list(ct, ct_whr)))
+```
+
+
+\begin{table}
+\begin{center}
+\begin{tabular}{l c c}
+\hline
+ & Dovecote & WHR \\
+\hline
+GNI per capita US                                          & $0.00^{*}$    &               \\
+                                                           & $(0.00)$      &               \\
+People in cities                                           & $0.00^{}$     &               \\
+                                                           & $(0.00)$      &               \\
+LGBTQ+ acceptance                                          & $0.64^{***}$  &               \\
+                                                           & $(0.16)$      &               \\
+Clean water                                                & $0.30^{}$     &               \\
+                                                           & $(0.30)$      &               \\
+Significant public campaign financing                      & $0.07^{**}$   &               \\
+                                                           & $(0.02)$      &               \\
+Party shadow governance                                    & $-0.26^{*}$   &               \\
+                                                           & $(0.14)$      &               \\
+Unemployment                                               & $-0.03^{***}$ &               \\
+                                                           & $(0.01)$      &               \\
+Women in white collar jobs                                 & $0.00$        &               \\
+                                                           & $(0.00)$      &               \\
+Years of compulsory education                              & $0.01^{}$     &               \\
+                                                           & $(0.01)$      &               \\
+Life expectancy                                            & $0.01$        &               \\
+                                                           & $(0.01)$      &               \\
+Access to electricity                                      & $0.00^{}$     &               \\
+                                                           & $(0.00)$      &               \\
+Intimate partner violence                                  & $-0.00$       &               \\
+                                                           & $(0.01)$      &               \\
+Internet users in population                               & $0.00$        &               \\
+                                                           & $(0.00)$      &               \\
+No shadow governance                                       & $0.17$        &               \\
+                                                           & $(0.13)$      &               \\
+Gov interferes in elections                                & $-0.30^{*}$   &               \\
+                                                           & $(0.13)$      &               \\           
+Legislature controls its own funds                         & $0.05^{*}$    &               \\
+                                                           & $(0.03)$      &               \\
+Military spending per capita                               & $0.00^{**}$   &               \\
+                                                           & $(0.00)$      &               \\           
+Strong relationships                                       & $2.01^{***}$  & $2.53^{***}$  \\
+                                                           & $(0.31)$      & $(0.36)$      \\
+Feelings of freedom                                        & $1.06^{***}$  & $1.33^{***}$  \\
+                                                           & $(0.27)$      & $(0.30)$      \\
+Healthy life expectancy at birth                           &               & $0.03^{**}$   \\
+                                                           &               & $(0.01)$      \\
+Log GDP per capita                                         &               & $0.36^{***}$  \\
+                                                           &               & $(0.07)$      \\
+Perceptions of corruption                                  &               & $-0.72^{**}$  \\
+                                                           &               & $(0.26)$      \\
+Generosity                                                 &               & $0.54^{*}$    \\
+                                                           &               & $(0.26)$      \\
+\hline
+Adj. R$^2$                                      & $0.82$         & $0.76$        \\
+CVE                                             & $0.48$         & $0.57$        \\
+Num. obs.                                       & $1,633$        & $1,964$        \\
+\hline
+\multicolumn{3}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}
+\caption{The Dovecote and WHR Models}
+\label{table:model_comparison}
+\end{center}
+\end{table}
+
+
+### Number of variables
+
+The first evident difference is that the Dovecote model uses nineteen variables (excluding
+the intercept and fixed effects for year, which are also used by the WHR).
+While nineteen is still a small number compared to the
+factors behind the many components of national life satisfaction, it is not
+surprising that a thorough search would reveal a larger number of variables 
+than six. As discussed below, nineteen is considered to be on optimal 
+tradeoff between parsimony, accuracy, and expressiveness. (Recall as well
+that this is necessarily a nation-level model, not individual-level.)
+
+### Model fit
+
+The second major difference with the WHR is model fit. The most recent reported 
+adjusted R-squared for the hand-picked model is 0.76. The adjusted R-squared
+for the Dovecote model is 0.82.
+
+However, due to concerns of possible over-fitting,
+out-of-sample cross-validation accuracy (measured as RMSE) was considered more important than
+in-sample fit, and so the WHR's six-variable model was reproduced to assess
+it on these grounds. As confirmation that this estimate is valid, the
+observed coefficient estimates, estimated fit, standard errors, and number
+of observations in this reproduction all identically matched those reported
+by the WHR.
+
+<!-- [1] "R^2=0.819, RSE=0.481, CVE=0.486" -->
+
+The out-of-sample error for this reproduction of the WHR model is 0.569.  
+The out-of-sample error for the Dovecote model is 0.486.
+<!-- (This is not a perfect comparison because, as discussed below, we do not use data -->
+<!-- from before 2011 in order to include the variable on gay and lesbian social  -->
+<!-- acceptance. However, restricting the WHR model to our same time period -->
+<!-- produces an identical measurement of the WHR's accuracy.) -->
+
+Given no evidence of over-fitting, a greater cross validation accuracy can be 
+considered an improvement irrespective of the number
+of variables required to achieve it. However, in addition, it can also be demonstrated
+that the improvement is not purely a result of simply having more variables.
+
+
+### The WHR's model fit can be achieved entirely without WHR variables
+
+It was found that it is possible to practically match the WHR's
+0.57 out-of-sample error with only three variables, and using not just the 
+same data as the WHR itself, but with almost 250 more observations.
+
+It can also be demonstrated that *none* of the WHR variables are 
+necessary to achieve a high model fit, in-sample or out-of-sample. 
+The fit of its six-variable model can be essentially matched
+using six completely different variables. Using only the reasonable set of
+variables on clean water, cities, education, electricity,
+unemployment, LGBTQ+ acceptance, and year fixed effects, an 
+entirely different six-variable model achieved an adjusted R-squared of 0.74, 
+compared to the WHR's 0.76, and an out-of-sample error of 0.58, compared to the 
+WHR's 0.57. Both of these models can be seen in Table \ref{table:gtwhrcoefs}. Note that 
+this six-variable model has *no* national economic measure.
+
+Thus there is material reason to doubt
+that the WHR's hand-picked model specification should be treated as an
+exceptional representation of the phenomenon it describes -- very much less to 
+"explain" global life satisfaction, to use its own words.
+
+<!-- Beating WHR accuracy w/o WHR variables -->
+```{r gtwhr, fig.cap="Contributions of Models Equivalent to WHR Fit", fig.align="center", out.width="45%", fig.show="hold"}
+
+df05 <- read.csv("whr y>=2005 na<25 Table21.csv", stringsAsFactors = F)
+df05$year_effect <- as.character(df05$year)
+    
+m_three <- lm(Life.Ladder ~
+                          year_effect
+                        + Social.support
+                        + Freedom.to.make.life.choices
+                        + log(sdg_GNI.per.capita..US..)
+                        ,
+                        data=df05)
+
+plot_bx_groups(m_three,
+               groups=c(
+                   "Social.support",
+                   "Freedom.to.make.life.choices",
+                   "log(sdg_GNI.per.capita..US..)"
+               ),
+               names=c(
+                   "Strong relationships",
+                   "Feelings of freedom",
+                   "Log GNI"
+               )) # ,
+
+m_nowhr <- lm(Life.Ladder ~
+                          year_effect
+              + sdg_Compulsory.education..duration..years.
+              + sdg_Access.to.electricity....of.population.
+              + spi_Acceptance.of.gays.and.lesbians...proportion.of.pop..
+              + spi_Satisfaction.with.water.quality..proportion.of.pop.. 
+              + sdg_Urban.population....of.total.population.
+              + wb_unemployment
+                        ,
+                        data=df11)
+
+plot_bx_groups(m_nowhr,
+               groups=c(
+              "sdg_Compulsory.education..duration..years.",
+              "sdg_Access.to.electricity....of.population.",
+              "spi_Acceptance.of.gays.and.lesbians...proportion.of.pop..",
+              "spi_Satisfaction.with.water.quality..proportion.of.pop..",
+              "sdg_Urban.population....of.total.population.",
+              "wb_unemployment"
+               ),
+               names=c(
+                   "Education",
+                   "Electricity",
+                   "Gay and Lesbian Acceptance",
+                   "Clean Water",
+                   "Cities",
+                   "Unemployment"
+               )) # , title=TeX("All Years, No WHR Variables"),
+               # subtitle=print_fit(m_nowhr, df25))
+```
+
+
+```{r, results='asis', eval=F}
+# As usual, used to produce the raw table, then manually edited
+print(texreg(list(m_three, m_nowhr)))
+```
+
+
+\begin{table}
+\begin{center}
+\begin{tabular}{l c c}
+\hline
+ & Approximates WHR Fit & No WHR Vars \\
+\hline
+Strong relationships                                       & $2.51^{***}$  &               \\
+                                                           & $(0.15)$      &               \\
+Feelings of freedom                                        & $1.93^{***}$  &               \\
+                                                           & $(0.10)$      &               \\
+log(GNI per capita)                                        & $0.42^{***}$  &               \\
+                                                           & $(0.01)$      &               \\
+Years of compulsory education                              &               & $0.08^{***}$  \\
+                                                           &               & $(0.01)$      \\
+Electricity                                                &               & $0.01^{***}$  \\
+                                                           &               & $(0.00)$      \\
+LGBTQ+ acceptance.                                         &               & $1.40^{***}$  \\
+                                                           &               & $(0.08)$      \\
+Clean water                                                &               & $1.65^{***}$  \\
+                                                           &               & $(0.14)$      \\
+Urban population                                           &               & $0.01^{***}$  \\
+                                                           &               & $(0.00)$      \\
+Unemployment                                               &               & $-0.04^{***}$ \\
+                                                           &               & $(0.00)$      \\
+\hline
+Adj. R$^2$                                                 & $0.75$        & $0.74$        \\
+CVE                                                        & $0.57$        & $0.58$        \\
+Num. obs.                                                  & $2199$        & $1633$        \\
+\hline
+\multicolumn{3}{l}{\scriptsize{$^{***}p<0.001$; $^{**}p<0.01$; $^{*}p<0.05$}}
+\end{tabular}
+\caption{Coefficients of Models with Equivalent Fit to the WHR's Hand-Picked Model}
+\label{table:gtwhrcoefs}
+\end{center}
+\end{table}
+
+
+### Improper presentation of the log can drastically overstate the direct contribution of GDP
+
+While these issues of fit are important, the largest single difference between the WHR and Dovecote
+models stems from the WHR's use of the natural logarithm to transform the variable of GDP per capita. 
+
+The WHR claims its decision to use the transform is justified because it
+"fits the data significantly better than GDP per capita" [@WHR]. However,
+not only is this at best marginally even true in the reproduction of
+the hand-picked model (with the log lowering the holdout error from 0.58 to 0.57), 
+it is definitively not the case in the more fully specified and higher 
+accuracy Dovecote model. In fact, no mathematical rationale is found for the transformation of GNI or GDP at all once sufficient controls are introduced. A linear model is a strictly better fit.  (An extended discussion can be found in the Methods section.)
+
+The most significant issue however is the fundamental problem with interpretation
+when mixing transformed and un-transformed variables. One is describing an additive
+effect, and one is describing a multiplicative effect. 
+
+Despite this, the Report has repeatedly presented the fundamentally incomparable
+transformed results in a way that clearly suggests they are directly comparable
+with the transformed ones -- resulting in an enormous exaggeration of the contribution.
+
+Using the same 1,964 observations that are in the WHR's reported model,
+Figure \ref{fig:logcomparison} shows the difference in estimated average variable
+contributions when using un-logged, vs logged, GDP in the WHR specification. With
+an un-logged variable, the contribution is measured at 0.30. With the logged
+variable, the contribution is measured at over 3.4 -- more than eleven times greater.
+In the Dovecote model as well, the use of a log transform on only 
+GNI appears to exaggerate its contribution by a factor of 26. Yet this fundamentally
+misleading comparison of factors has so far been used, without warning or notes on interpretation,
+in 2015, 2016, 2017, 2019, 2020, 2021, 2022, and 2025.
+
+```{r logcomparison, fig.cap="The Effect of a Log Transform on GDP", fig.align = "center", out.width="45%", fig.show="hold", warnings=F, }
+plot_bx_groups(m_whr, 
+               title=TeX("Six-Variable Model, log(GDP)"),
+               # subtitle=print_fit(m_everything_whr, df25),
+               absolute.value=F)
+
+m_whr_nolog <- lm(Life.Ladder ~
+                        year_effect
+                        + Social.support
+                        + Healthy.life.expectancy.at.birth
+                        + Freedom.to.make.life.choices
+                        + exp(Log.GDP.per.capita)
+                        + Perceptions.of.corruption
+                        + Generosity
+                        ,
+                        data=dfwhr)
+
+plot_bx_groups(m_whr_nolog, 
+               title=TeX("Six-Variable Model, GDP (no log)"),
+               # subtitle=print_fit(m_everything_whr_nolog, df25),
+               absolute.value=F,
+               levels=rev(c(
+                   "exp(Log.GDP.per.capita)",
+                   "Social.support",
+                   "Freedom.to.make.life.choices",
+                   "Healthy.life.expectancy.at.birth",
+                   "Generosity",
+                   "Perceptions.of.corruption"
+               )))
+```
+
+Thus while the WHR model appears to suggest that GDP per capita explains nearly 40%
+of national satisfaction, as the number one factor of six,
+the Dovecote model indicates that the national economic indicator of GNI per capita
+independently contributes barely 1.5% to the model of average national satisfaction as, at highest, the 12th most important variable out of nineteen.
+
+An argument in support of GDP could fairly point out that several of the variables
+in the Dovecote model are clearly factored into GDP in various ways, 
+meaning there may be problems with overlapping definitions. However, given the 
+vast range of activities that are accounted for in such a measure, 
+simply clarifying which parts of GDP are predictive of satisfaction is 
+an important increase in precision. This also avoids the easy but erroneous thinking
+that "GDP" predicts satisfaction, and so anything inside of the umbrella definition 
+of "GDP" does, as well. Such thinking risks severe errors.
+
+### The Lasso chose several survival basics the WHR omits
+
+Last, the Dovecote model choose variables including water, education, political power, and gender equity that the WHR model does not have. This contributes to the prima facie plausibility of the model, and the variable search procedure.
+
+Thus in terms of precision, actionability, policy relevance, and measurable accuracy,
+we believe the Dovecote model offers a valuable alternative to the current state of the art.
+
+# Discussion 
+
+## The problems with GDP are extensively documented
+
+National economic indicators have been questioned for many years, and 
+it is worth briefly reviewing some of the arguments against them.
+
+One is that GDP and GNI fail to effectively account for environmental degradation
+or carbon emissions, which is especially concerning when they are so tightly correlated [@GDPvsCO2].
+
+<!-- Relationship between GDP and emissions -->
+```{r, eval=T, fig.cap="National Carbon Emissions by GDP, from Our World in Data", fig.align = "center", out.width="100%"}
+# https://ourworldindata.org/grapher/co2-emissions-vs-gdp
+include_graphics("gdp and emissions.png")
+```
+
+Others failings include the poor job that GDP and GNI do when estimating the
+quality of even basic and common resources such as education, technology, and 
+medical care, especially such unpaid survival fundamentals as parenting and child rearing.
+
+Though it is perhaps most disturbing that for many researchers,
+the entire purpose of measuring life satisfaction is to *replace* GDP as a national compass, due to 
+these and other many, fundamental, documented failures [@Mismeasuring].
+
+This makes it especially difficult to see this 2600% exaggeration of GDP
+in an internationally distributed and globally respected publication that 
+refers to itself as the "World Happiness Report."
+
+However, the greatest contribution of the Dovecote model may be not
+in its estimates of specific variables, but in the patterns suggested by those variables
+regarding effective policy directions for the future.
+
+## "Institutional" variables did not appear as expected
+
+While many of the discovered variables are unsurprising, the initial expectation was for the model to return extensive descriptions of formal institutions, or governance structures such as 
+a bicameral legislature. It was anticipated that, as the systems shaping the nature of life
+in a country, these would not only feature prominently, but also describe the kind of 
+system that was most beneficial for life satisfaction.
+However in the search results, these institutional variables played an unexpectedly small role.
+
+The most specific and unexpected omissions -- and much of the expectation of "institutional" 
+variables -- came from the most recent Nobel-winning economics work of Acemoglu, Johnson, and Robinson. The paper cited in the announcement of their prize [@ColonialOrigins], as well as the general audience book they wrote on the subject [@WhyNationsFail], squarely identifies "institutions" as the predominant reason for the success or "failure" of nations. In particular, property rights are repeatedly named as a
+critical institution. However, despite three separate variables in the data specifically detailing property rights, not one was ever selected by the search procedure, in any iteration of the algorithm. The same was true for judicial independence, presidential versus parliamentary systems, the rule of law, or their central methodological variable, the risk of expropriation of property. Every one was hypothesized to be critical by their paper -- every one was available in the data -- none were selected by the search procedure.
+
+Because the outcome variables of our models are so different -- income, as compared to satisfaction -- this omission in no way invalidates their findings. Property rights could be good for one, and not the other. But this finding does appear to emphasize that wealth and satisfaction are
+quite fundamentally different phenomena, and that guiding our policy, research, and recognition by one holds no guarantee of improving the other. This is especially critical given the branding of their work. The book is titled not "Why Nations Have Lower Income," but "Why Nations Fail." Like GDP before it, and with many of the identical problems, income is being treated as the ultimate determinant of a nation's success.
+
+Even when broadening the definition beyond property rights,
+the systematic omission of other "institutional" variables is not due to a lack of opportunities.
+The V-Dem dataset makes available almost two thousand variables
+on the structure and powers of the legislature, 
+the head of state, the judiciary, elections, deliberation, the media,
+social exclusion, political equality, and civil and academic society.
+
+However, when all of these were made available as predictors,
+there were only two conceptual categories that appeared in the final model.
+These were a government that acted independently from outside forces (as represented by variables on a legislature being able to control its own funds, and the absence of a shadow government),
+ and that elections were free, open, and fair (as represented by variables on significant public financing for campaigns, and no interference from the ruling party in elections).
+
+## The strongest institutional signal was for the equitable and inclusive distribution of political power
+
+The variables that were selected tell a clear and consistent story.
+They suggest that national satisfaction is dependent upon not just equitable and meaningful access to political power, but also upon a guarantee that this power will actually mean something once it is assumed.
+
+From this perspective, it is also easy to hypothesize that no other variables were selected because 
+when these requirements are not fulfilled, the details of what happens downstream
+become inconsequent. Systems in which voting is technically allowed clearly 
+cannot benefit when only un-elected individuals actually wield any power.
+Systems in which everyone is legally allowed to run for office, but the vast
+majority of people are not financially able to do so,
+recall the observation attributed to Mark Twain that
+"The man who does not read has no advantage over the man who cannot read." 
+
+This is broadly in agreement with Acemoglu et. al, whose conclusion 
+is that institutions must be inclusive, and not extractive, to build national wealth.
+They also hypothesize the importance of education and civil liberties, both of which we find evidence for. Furthermore, when the five "institutional" variables in the Dovecote model are summed, their total
+contribution is tied for fifth largest. 
+
+However, this fifth-largest contribution still represents less than six percent of the total. Taken together, the data urges us to look beyond the institutional hypothesis.
+
+## Individuals are the only stable component of any institution
+
+If "institutions," which describes only collections of people with unspecified structure, are not found to have the predictive power expected,
+then one obvious approach is to revert to a level of analysis with more
+reliable construct validity -- the individual. From this perspective, there
+are two theories that immediately suggest themselves for explaining the results here.
+
+Social Dominance Orientation (SDO) [@SDO] and 
+Right Wing Authoritarianism (RWA) [@RWA]
+are the two major theories from the generalized prejudice literature in 
+psychology. These theories have seen a resurgence of interest in recent 
+years as they have proven to be exceptionally strong predictors of 
+contemporary political voter behavior, most notably around the
+monumental shifts of Brexit [@Brexit] and the now repeated election of Donald Trump [@RWASDOPolitics]. 
+
+SDO describes the extent to which a person believes in a group-based social hierarchy.
+It correlates highly with racism, sexism, homophobia, and other similar 
+group-based prejudices. People high in SDO spend substantial effort building power for themselves,
+often at the expense of others.
+
+RWA describes the extent to which a person submits to, and enforces the mandates of,
+established authority figures. A defining consequence of these behaviors is that a
+person high in RWA will believe and obey the chosen authority despite any conflict
+in logic, evidence, or sometimes even visible reality.
+
+Individuals high on both scales believe in a strong social hierarchy, and that they belong
+at its peak. They fight for power no matter the legitimacy of their own claim to it,
+easily justify immoral behavior, reject all undesirable information, and are unsurpassed in
+xenophobia. Unlike individuals high only in RWA, who are primarily followers, these "double highs" [@RWA]
+are authoritarian leaders.
+
+Together, these two personality traits have direct and immediate relevance to fully thirteen of the nineteen discovered variables. Strong relationships, LGTBQ+ social acceptance, feelings of freedom, autonomous government, inclusive power, education, high employment, and urban populations, are all theoretically and empirically contrary to one or both of these authoritarian traits. When you further consider the indifference of authoritarian regimes to providing basic survival needs such as healthcare, clean water, or electricity, almost the entire list -- and 95% of the contribution -- appears to be against authoritarian thinking, policy, and rule. Only the 3% combined contribution from GNI and military spending would seem to point in the opposite direction.
+
+In addition, laboratory studies came to an identical conclusion [@GCG], finding in model-UN-like roleplaying simulations that “double low” players were eager and effective problem solvers, while “double high” subjects were prepared to destroy the game’s world through nuclear warfare — not once, but twice in the same simulation. We consider the Dovecote model to reproduce these results, this time using almost two decades of non-simulated and international data, representing millions of respondents.
+
+
+## The decline of democracy, or of life itself?
+
+This focus on institutions is inspired not just by the data, or the Nobel Prize, but by the central role
+institutions have been playing in national discourse. In particular, and for many good reasons, "democracy" is likely the institution that appears most frequently in national media -- most often to warn of its continuing and precipitous decline [@DeclineOpEd1, @DeclineOpEd2, @DeclineOpEd3, @DeclineOpEd4, @DeclineOpEd5]. 
+
+However, no matter how earnest those discussions, or ample their evidence, only 48% of polled Americans reported they "Agree strongly" that democracy is the best form of government [@48pct], and in back to back elections, only 7% of polled voters said fixing democracy was the most important problem facing the country [@7pct]. Faced with the findings of the Dovecote model, and of this extraordinary indifference of the public, responding with an argument reiterating democracy's value is an emotionally understandable response -- but a more effective one, both for life satisfaction and for democracy itself, is likely to talk about something the country actually cares about. This paper attempts to point us towards not just a more academically accurate understanding of the world, but one that millions of people can now grasp through personal experience: The political actions currently taking place in the United States do not just damage democracy. They make life itself worse. 
+
+This is of such paramount importance because to a population that is angry, fearful, frequently misinformed, often knowingly misled, and long since sick of abstractions without results, a better life will always be a -- perhaps the only -- reliable source of hope. In other words, life satisfaction is a goal that is innately capable of uniting a divided public, because it is a true goal, to which the processes we hypothesize will always be secondary. It is now a truly existential challenge for us to be able to honestly seek, and accurately identify, the ways to achieve those better lives. We risk losing the forest for the trees if discussion of productivity, or precedent, or parliamentary procedure overtakes action on meaningful movement towards lives that we actually experience as better.
+
+Furthermore, we misdirect our hopes if we fail to consider the most fundamental component of any of the systems we are trying save: individuals making choices about other individuals. The idea of “institutions” has a respectable abstraction to it, and if an institution is simply the codification of good behavior, then it is an almost tautologically good thing. But it is an explanation that loses all value when the individuals inside of that institution have willfully abdicated the duties required of them [@IDontKnow, @NotMyJob, @ImNotQualified]. Without faithful executors, the goals, traditions, and even laws of any institution simply have no meaning. Where do we then turn?
+
+The inevitable answer is that we must empower individuals: people who can be trusted to save the things we want to save, and make possible the lives we wish to live. And it is equally inevitable that the only kind of people who can be trusted to improve our lives are those who actually want to. The Dovecote model provides strong lessons for who these people are, and how they might be found.
+
+
+# Methods
+
+## Principles for an improved model
+
+### The greatest possible scope
+
+The primary motivation of our re-analysis is a skepticism that the published six
+variables can meaningfully "explain" -- the word used repeatedly by the WHR --
+either individual, or national, life satisfaction. Given the highly
+correlated nature of many of the independent predictors, the primary concern was not
+the original model's ability to predict life satisfaction with low
+error, but the more serious and structural problem of omitted variables. 
+
+In practice, this was carried out through a ``kitchen sink" approach. The availability of
+country-level averages made it possible to find any dataset that was also
+labeled by country and year and join it to the provided outcome data. With such an unbounded 
+objective, it is impossible to ever claim a truly comprehensive collection,
+but a rigorous search compiled data sets from a large number of reputable
+sources. These sources included the World Bank, Varieties of Democracy,
+the Organisation for Economic Co-operation and Development (OECD), the United Nations,
+the international micro-lending organization Kiva, the Social Progress Imperative, the 
+World Inequality Database, Journalists Without Borders, the International Monetary 
+Fund, the World Health Organization, the Pew Research Center, and many others.
+In all, the final dataset included variables on extensive social, governmental,
+technological, environmental, health, financial, and economic indicators,
+including GDP, economic sector size, individual rights, military spending, immigration,
+trade deficits, life expectancy, charitable giving, abortion access,
+poverty, inequality, corruption, internet access, LGBTQ+ safety, national emotions,
+freedom of the press, and much more. 
+
+### The Most Objective Possible Specification
+
+In addition to casting a wide net for possible variables, it was considered
+crucial to follow a maximally data-driven approach to model selection. For a 
+question as large as the one the model poses -- What are the drivers of 
+large-scale human satisfaction? -- a primarily manual specification was considered unnecessary, badly
+prone to bias, and far too consequential for the potentially enormous errors
+of omission. 
+
+## The Data
+
+The outcome data was made available by Gallup, as supplemental files
+to the WHR [@WHR]. All national average estimates are made available beginning
+from 2005, for a total of 2,199 country-year measurements over the 
+six WHR variables, of which 1,964 are complete. These complete observations are used by the WHR in its reported model.
+
+In our effort to determine which independent variables should be included in a 
+model, first, over five thousand variables were collected for each of the years 2019 and 2023.
+After multiple means of examination,
+these two years were considered to be satisfactorily representative of the others. 
+
+The results from these initial models suggested that of the multiple dozen identified,
+datasets from just six sources were necessary to provide all of the variables that were selected by the algorithm. These sources
+were the WHR [@WHRData], the Sustainable Development Goals [@SDGData], the Social Progress
+Imperative [@SPIData], Varieties of Democracy (V-Dem) [@VDem], the Stockholm International Peace Research Institute [@Sipri], and the World Bank, particularly their data on unemployment and immigration [@WBData]. These datasets combine a collection of techniques in their construction, including modeled estimates, expert assessments, and non-panel random samples.
+
+For the majority of variables, these datasets included measurements for 
+the full historical range of the WHR data. However there were a number of 
+critical exceptions. Believed to be most important is a variable from the 
+Social Progress Imperative, "Acceptance of gays and lesbians (proportion of pop.)"
+This is the sole public variable found on social acceptance of any LGBTQ+ people
+over a sufficiently large number of countries and years to be modeled, and it is only 
+available from 2011 onwards. 
+
+When restricting analysis to just these years, 
+this variable on social acceptance was so reliably selected by the model that it was
+chosen even in a specification that was forced to produce as few as
+six variables, meaning it was selected even before ``Freedom to make life choices.'' 
+Due to our fundamental focus on avoiding the risks of omitted variables, the choice was
+thus made to model only years from 2011 to the present. This still left a sample
+83% the size of the WHR's.
+
+For exhaustive rigor, models were also built on the full historical range
+of available data. This model gave very similar results to the models
+reported, with similarly high accuracy, choosing very similar variables,
+and with systematically higher statistical significance.
+
+
+## The Model Estimation Process
+
+The primary challenge for modelling was the large number of independent
+variables compared to the far smaller number of observations.
+To solve this problem, the highly under-determined system was estimated using
+an iterative procedure centered around an L1-penalized linear regression [@Lasso].
+After the variables had been selected in this manner, they were used to specify an 
+un-penalized linear. These results are reported.
+
+## Robustness Checks in the Estimation Process
+
+Given concerns about stability in this highly under-determined system, there
+were extensive checks for robustness. The main procedure estimated each penalized model
+25 times, each time using different random subsets of 95\% of the rows.
+As expected, each such iteration selected somewhat different variables. 
+However, when this process was repeated many times, the results 
+stabilized into a subset of variables that appeared with high frequency.
+The variables that appeared consistently in these iterations were then chosen to
+be included in the next phase of the model.
+
+In tests, this procedure found models with accuracy equal to that of the regular Lasso,
+but using far fewer variables, as the simple Lasso typically included multiple 
+conceptually identical variables.
+
+## Variable Selection
+
+For the main model, the weights on the penalty took the form
+$\exp(-\lambda)$. 
+A value of $\lambda=2.5$ was found to effectively balance prediction power and parsimony.
+This model produced 16 variables that were selected in 100% of the 25 robustness
+bootstraps described above. Another three were selected in 96% of the iterations, or 24 times. All other
+variables were either chosen with substantially less consistency, or represented
+a contribution of negligible magnitude. Following our goal of a maximally objective result,
+these 19 variables are reported as they were selected, without substitutions.
+
+Two pre-processing steps were used for interpretability, in addition to our threshold for missingness.
+Individual disease deaths such as tuberculosis and cancer were removed from consideration as they competed for magnitude with life expectancy, but were far less stable across search iterations. Composite variables were also removed from consideration, due to the serious difficulties they posed in interpretation, and the unprincipled weighting used to construct them.
+
+## Further evidence against the use of log GDP
+
+Some of the confusion around use of the log may stem from the fact that a simple plot of satisfaction
+by log GNI or GDP does show a strongly linear relationship. However, this two-variable
+relationship is immaterial when the very nature of the exercise is to 
+consider the variables as part of a larger model.
+The real question is whether or not the log is an appropriate transform for GNI
+when it is used as in input to a fully-specified regression. This can be easily checked by fitting
+a Generalized Additive Model (GAM) with the set of variables from the
+Dovecote model, and applying a non-parametric transform
+just to the GNI term. This term will then have the flexibility to assume whatever
+form best fits the data. Figure \ref{fig:gams} shows a plot of the non-parametric
+fit, overlaid in red with the best fit line, and the best fit logarithmic curve. 
+
+<!-- Creating the GAM plots -->
+```{r, eval=F}
+mgam <- gam(Life.Ladder ~
+                  year_effect
+    + e_pelifeex
+    + Freedom.to.make.life.choices
+    + s(sdg_GNI.per.capita..US..) # remove, for the linear model
+    # sdg_GNI.per.capita..US..    # add, for the spline model
+    + sdg_Urban.population....of.total.population.
+    + sipri_percap
+    + Social.support
+    + spi_Acceptance.of.gays.and.lesbians...proportion.of.pop..
+    + spi_Access.to.electricity.....of.pop..
+    + spi_Satisfaction.with.water.quality..proportion.of.pop..
+    + v2elpubfin
+    + wb_unemployment    
+    + v2exctlhs_0
+    + sdg_Compulsory.education..duration..years.
+    + spilong_Internet.users....of.pop..        
+    + v2exctlhs_2
+    + v2lgfunds
+    + v2elsnmrfc_16
+    + sdg_Employment.in.services..female....of.female.employment...modeled.ILO.estimate.     
+    + spi_Intimate.Partner.Violence....of.women.aged.15..  
+, data=df11)
+
+# Fit a line to the .predicted points
+out <- plot(mgam)
+m.nolog <- lm(out[[1]]$fit ~ out[[1]]$x)      # R^2=0.715 
+m.log   <- lm(out[[1]]$fit ~ log(out[[1]]$x)) # R^2=0.512
+
+plot(mgam, xlab="GNI per capita", ylab="spline(GNI per capita)")
+abline(m.nolog, col="red")
+
+plot(mgam, xlab="GNI per capita", ylab="spline(GNI per capita)")
+points(x=out[[1]]$x, y=-.9974+.110*log(out[[1]]$x), type="l", col="red", add=TRUE)
+```
+
+
+```{r gams, fig.cap="The Comparison of Linear and Log Fits to GNI", fig.align = "center", out.width="45%", fig.show="hold"}
+include_graphics("gam line.png")
+include_graphics("gam log.png")
+```
+
+The line achieves an $R^2$ of 0.72, and the log achieves
+an $R^2$ of only 0.51. In other words, this is further evidence that,
+once all of the relevant variables are taken into account, the conditional 
+relationship between satisfaction and GNI is best described linearly
+
+If there is a desire to capture any non-linerarity there might be, this can 
+still be accomplished with a piecewise linear model, with none of the 
+distortions in presentation caused by the log. However, doing so even with the 
+model that uses only log GDP finds very modest differences between the low and high
+GDP regimes. The low-GDP countries show an estimated contribution of 5.8%, and the 
+high-GDP countries a contribution of 1.2%. In neither case does it approach the
+suggested 40% of the WHR six-variable model.
+
+
+# Handling Missing Data
+
+Variables with missing values were an issue in all data sources, including 
+those from the WHR itself.
+
+Once examined closely, it became clear that less than a quarter of collected variables
+from 2019 and 2023 were over 75% complete for the 156 countries included in the WHR.
+It was also observed that allowing variables up to 75% missing would dramatically
+increase the number of variables available -- as, with so many independent variables,
+practically no observations were entirely complete.
+Consequently, using 25% missing as a threshold, all of these approximately 1,300 variables 
+were used in the initial models, with the missing values imputed by random forest.
+After repeated tests, the randomness of the imputation did not appear to play any role
+in the final results.
+
+Once the key data sets and time periods had been identified, there were 1,067 variables that 
+were available for all 12 years of data, and
+that were also at least 75% non-missing during those periods. The variable selection process 
+chose between these 1,067. 
+
+While 25% missing was allowed in the variables that were searched,
+in the final pooled specification, the average missingness per column was less than 7%.
+Tests were performed to assess the impact of the missing data, including 
+removing rows with high missingness, and entirely removing the most missing
+variables entirely. Neither change made any meaningful difference to the 
+model estimates for the remaining variables. 
+
+One exception was made to the 25% threshold during the search procedure, for the variable
+Women in white collar jobs, as it was a substantial component of the model using data back to 2005, but was 27.3% missing in the data from 2011. Further support for its inclusion is in the fact that 
+Women's social and political power, which is well below the missingness threshold, shows a far larger contribution when added to the model -- however it was not selected by the search procedure, 
+and so it is not included in the model.
+
+# Causality
+
+While from the perspective of identification this model is purely predictive, 
+the same is true of the WHR model, which still describes itself as being able to "explain"
+national satisfaction. The Dovecote model provides several distinct 
+advantages in terms of the specificity, policy relevance, and simple plausibility
+of our variables. For example while the WHR only has a variable on "feelings" of freedom, the Dovecote model
+provides multiple variables that likely serve as intervention-ready mechanisms for those feelings, 
+such as equity and opportunity in political power. Similarly, the WHR
+has only public "perceptions" of corruption. This is not only a bad target for 
+intervention (as the goal is to improve the corruption, not the perception) but
+comparison with a more objective measure of government effectiveness finds 
+very little correlation. By contrast, the Dovecote model uses a panel of expert assessments
+that indicate where power is actually held in the national government.
+
+```{r wbgiVSpoc, fig.cap="Government effectiveness vs. Perceptions of corruption", fig.align = "center", out.width="65%", fig.show="hold", eval=T}
+p <- ggplot(df05, aes(x=e_wbgi_gee, y=Perceptions.of.corruption)) +
+    geom_point()
+p
+```
+
+Though above all, it is reassuring to verify the data-driven recovery of numerous
+basic phenomena that the WHR simply fails to include, such as water, employment, elections,
+infrastructure, education, personal safety, and political power -- most of which
+have independent or even self-evident validation as qualitatively causal, at least at the level of the individual.
+Furthermore, the highly consistent themes of the discovered variables -- Basic Needs,
+Social Inclusion, and Societal Self-Determination -- each reflect a well established
+driver of life satisfaction, further supporting a high-level causal argument, 
+even in the absence of an identification strategy.
+
+Therefore while more explicitly causal work is necessary, 
+practically all of the discovered variables are highly plausible as direct
+causal contributors at the national level, and frequently more plausible than the current variables.
+
+The most prominent exception to a simple causal story 
+is the variable on the proportion of internet users in a country - 
+not only because there is a large body of work documenting its potential harms [@Misinformation, @Ressa],
+but also because it is the single variable that flips sign, and is actually measured
+as a negative contribution when using data back to 2005. Its selection by the search 
+procedure is interpreted as an indication of the critical nature of information availability,
+and its bivalent nature as an indication of the complexities inherent therein: harassment [@Harassment], disinformation exposure [@Misinformation], and the potential for radicalization [@Radicalization].
+
+# Dependencies, granularity, and interpretation
+
+This work is a step towards a better understanding of nation-level
+life satisfaction, but there are clearly many questions that it leaves unanswered. In addition to the causal issues raised above, the dependencies between the variables -- not to mention any that were unobserved -- are likely highly complex. This suggests at a minimum that the "contributions" of each variable are informative, but likely part of a more complex story. This is also the case because of the nature of the variables available. While two thousand were available for the minutiae of government, only a single, and furthermore binary variable, was available for the single greatest contributor: strong social relationships. While it is imperative that more data on these critical phenomena be collected globally, it is also the case that with greater specificity, the story may gain further nuances.
+
+
+# Additional Information
+
+## Declaration of interests
+None of the authors have competing financial or non-financial interests
+
+## Ethics and inclusion
+The inherently global nature of the study made it impossible to consult with all 
+of the regions whose data was used in this research, but
+all communication related to better understanding the local contexts of our model,
+and how it may affect our interpretation of results, is warmly welcomed.
+
+## Data Availability
+The majority of the data used in this study is publicly available, and links 
+can be found in the supplementary information. The one exception is data from the Social Progress
+Imperative, which is available for a fee based on the nature
+of the purchasing institution. This is also the reason that the full study
+dataset is not publicly accessible. However, the joined
+data can be provided upon request with proof of an appropriate license to the non-public component.
+
+<!-- For reviewers, the joined data will be provided directly along with submission.  -->
+
+## Code availability
+While no critical software or algorithmic advances were
+made in this paper, the code will be made available in a public github repo
+before publication for convenience of replication. 
+
+<!-- For the reviewers, the code will be provided directly along with submission. -->
+
+## Human subjects disclosure
+### Ethical compliance
+All relevant ethical regulations have been complied with.
+
+### Ethics committee
+The ethics committee at The Dovecote Institute provided guidelines for study procedures as protocol approval was not required. (All data used in this study with a human component is from publicly or commercially available, secondary, nationally aggregated, non-identifiable sources.)
+
+### Informed Consent
+Informed consent for all data collection, where relevant, was obtained by the owners of the datasets used in this study.
+
+<!-- \clearpage -->
+
+# References
+<div id="refs"></div>
+
+<!-- \clearpage -->
+
+# Figure and Table Legends
+
+Figure \ref{fig:mbx}: Contributions of the Dovecote Model. This figure shows the estimated model coefficients $\hat{\beta}$ times the average national value for that variable $\bar{x}$. In the World Happiness Report, this is referred to as the "contribution" of a variable to a country's life satisfaction. Our estimates differ in that they are averaged across all countries for interpretability. Colors denote significance where, again following the WHR's convention, navy blue indicates significance at the .01 level, dark blue at the .05 level, light blue at the .10 level, and grey any p-value higher than that. Error bars indicate 95% confidence intervals and use clustered errors, clustered by country.
+
+Table \ref{table:model_comparison}: The Dovecote and WHR Models. This table shows the estimated linear regression coefficients for the main Dovecote and WHR models. The WHR parameter estimates are published in the WHR itself, but are reproduced here to demonstrate that our methods are identical, and to allow a direct comparison.
+
+Figure \ref{fig:gtwhr}: Contributions of Models Equivalent to WHR Fit. This figure has the same structure and meaning as the main result Figure \ref{fig:mbx}, but instead uses either far fewer variables, or a set of variables none of which are in the WHR's six-variable model. This demonstrates that the statistical fit of the WHR's six-variable model is not exceptional.
+
+Table \ref{table:gtwhrcoefs}: Coefficients of Models with Equivalent Fit to the WHR's Hand-Picked Model. This table reports the estimated linear regression coefficients of the two models shown in \ref{fig:gtwhr}
+
+Figure \ref{fig:logcomparison}: The Effect of a Log Transform on GDP. These two graphs demonstrate the dramatic difference in estimated contribution that comes from using, or not using, a logarithmic transformation in the GDP variable in the WHR's six-variable model.
+
+Figure \ref{fig:gams}: The Comparison of Linear and Log Fits to GNI. These two graphs show the spline fit to the GNI variable in a Generalized Additive Model (GAM) version of the main Dovecote model. All other variables are linear, as in the original. In red, the graph on the left shows a line of best fit to the spline, and graph on the right shows a logarithm of best fit to the same spline. As the line shows a fit of R^2=0.72 to the estimated spline and the log a fit of only R^2=0.51, we find no mathematical rationale for the use of the logarithm on GNI, when using a full set of conditioning variables as in the Dovecote model. (This is of course in addition to the fundamental incomparability of multiplicative and additive coefficient estimates.)
+
+Figure \ref{fig:wbgiVSpoc}: Government effectiveness vs. Perceptions of corruption. This figure plots the Perceptions of corruption variable used by the WHR against the Varieties of Democracy (V-Dem) variable Government effectiveness. The relatively poor correlation between them is used to demonstrate that perceptions of corruption is not a high-quality proxy for actual government function. This is one of several reasons why there are better choices, and why it is left out of the Dovecote model despite being in the six-variable model, though the primary reason is that it was simply not selected by the search algorithm.
+
+<!-- supplementary -->
+<!-- \clearpage -->
+<!-- # Supplementary Information -->
+
+<!-- ## Variable definitions -->
+
+<!-- Life Satisfaction: Average national life satisfaction, as measured on a scale of 0-10 by the Cantril Ladder (described above). -->
+
+<!-- GNI per capita: The nation's Gross National Income divided by its population. -->
+
+<!-- Log GDP per capita: The logarithm of the nation's Gross Domestic Product divided by its population. -->
+
+<!-- People in cities: The portion of the country that lives in urban areas. -->
+
+<!-- Strong relationships: The national average to the binary question, "If you were in trouble, do you have relatives or friends you can count on to help you whenever you need them, or not?" -->
+
+<!-- Compulsory Education: The number of years of education that are required by law, not necessarily in practice. -->
+
+<!-- Feelings of Freedom: The national average to the binary question, "Are you satisfied or dissatisfied with your freedom to choose what you do with your life?" -->
+
+<!-- Life Expectancy: The national average number of years lived. -->
+
+<!-- Healthy Life Expectancy: The national average number of *healthy* years lived; typically measured as around ten years shorter than unconditional life expectancy. -->
+
+<!-- Unemployment: National estimate of the share of the labor force that is without work but available for and seeking employment. Definitions of labor force and unemployment differ by country. -->
+
+<!-- Public Campaign Financing: An expert assessment to the question "Is significant public financing available for parties’ and/or candidates’ campaigns for national office?" -->
+
+<!-- Party Shadow Governance: An indication that an expert assessment has chosen "The ruling party or party leadership body (in a one-party system)" in answer to the question "In practice, from which of the following bodies must the head of state customarily seek approval prior to making important decisions on domestic policy?" -->
+
+<!-- No Shadow Governance: An indication that an expert assessment has chosen "None" in answer to the question "In practice, from which of the following bodies must the head of state customarily seek approval prior to making important decisions on domestic policy?" -->
+
+<!-- LGBTQ+ Acceptance: The proportion of respondents answering yes to the -->
+<!-- question, “Is the city or area where you live a good place or not a good place to live for gay or lesbian -->
+<!-- people?” While we are confident this assessment is also indicative of other LGBTQ+ acceptance, it is important to note that the original data source does not mention them explicitly. -->
+
+<!-- Clean Water: The proportion of the population satisfied with the quality of their water. -->
+
+<!-- Access to Electricity: The proportion of the population with access to electricity: -->
+
+<!-- Intimate Partner Violence: The proportion of women over the age of 15 who have experienced intimate partner violence. -->
+
+<!-- Military spending: The amount of money spent on the military, divided by the population of the country. -->
+
+<!-- Internet users: The proportion of the country that uses the internet regularly. -->
+
+<!-- Election interference: An indication that an expert assessment has chosen "Areas where the national ruling party or group is weak" in answer to the question "How would you describe the areas of the country in which elections are significantly more free and fair?" -->
+
+<!-- Legislative independence: An indication that an expert assessment has chosen "Yes" in answer to the question "In practice, does the legislature control the resources that finance its own internal operations and the perquisites of its members?", as opposed to "No. The benefits legislators receive or the finances needed for the legislature’s operation depend on remaining in good standing with an outside authority, such as the executive." -->
+
+<!-- Women in white collar jobs: This is the estimated proportion of women in the country who are employed outside of the fields of agriculture and industry. While the original data source refers to these as "service" industry jobs, their definition suggests they are better thought of as more generally white collar. -->
+
+<!-- Generosity: The residual of regressing national average of response to the GWP -->
+<!-- question “Have you donated money to a charity in the past month?” on GDP -->
+<!-- per capita. -->
+
+<!-- Perceptions of corruption: The national average of the survey responses to two questions in the GWP: “Is corruption widespread throughout -->
+<!-- the government or not” and “Is corruption widespread within businesses or -->
+<!-- not?” The overall perception is just the average of the two 0-or-1 responses. In -->
+<!-- case the perception of government corruption is missing, the perception -->
+<!-- of business corruption is used as the overall perception. The corruption perception at -->
+<!-- the national level is just the average response of the overall perception at the -->
+<!-- individual level. -->
+
+<!-- Immigration per capita: Net migration is the net total of migrants during the period, that is, the number of immigrants minus the number of emigrants, including both citizens and noncitizens -- then divided by the population of the country. -->
+
+
+<!-- ## A summarized plot of the Dovecote model results -->
+
+<!-- Many of the model variables are conceptually similar, so it is valuable to -->
+<!-- visualize them grouped together. This can be seen in Figure \ref{fig:summarizedresults}. When contributions differ in sign, the sum -->
+<!-- represents the sum of their absolute values. The following graph introduces the groupings of -->
+<!-- "Accessible Political Power," which is composed of (no) Government Election Interference and Public Campaign Financing; "Good Information Access," which is composed of Years of Compulsory Education and Internet Users; "Meaningful Political Power," which is composed of No Shadow Governance, (no) Party Shadow Governance, and Legislative Independence, and "Gender Equity," which is composed of Women in White Collar Jobs and (no) Intimate Partner Violence. Each of these is marked with an asterisk to indicate this grouping. -->
+
+<!-- <!-- Grouped Results --> -->
+<!-- ```{r summarizedresults, fig.cap="Summarized Results of the Dovecote Model", fig.align = "center", out.width="90%", fig.show="hold", eval=T} -->
+<!-- money <- data.frame( -->
+<!--     "variable"=c( -->
+<!--         "Life Expectancy" -->
+<!--        , "Feelings of Freedom" -->
+<!--        , "GNI per capita" -->
+<!--        , "People in Cities" -->
+<!--        , "Military Spending" -->
+<!--        , "Strong Relationships" -->
+<!--        , "LGBTQ+ Acceptance" -->
+<!--        , "Access to Electricity" -->
+<!--        , "Clean Water" -->
+<!--        , "Unemployment" -->
+
+<!--        , "*Accessible Political Power" -->
+<!--        # , "No Election Interference" -->
+<!--        # , "Public Campaign Financing" -->
+
+<!--        , "*Good Information Access" -->
+<!--        # , "Compulsory Education" -->
+<!--        # , "Internet Users" -->
+
+<!--        , "*Meaningful Political Power" -->
+<!--        # , "No Shadow Governance" -->
+<!--        # , "Party Shadow Governance" -->
+<!--        # , "Legislative Independence" -->
+
+<!--        , "*Gender Equity" -->
+<!--        # , "Women in White Collar Jobs" -->
+<!--        # , "Intimate Partner Violence" -->
+<!--     ), -->
+<!--     "val"=c( -->
+<!--        0.421, #  "Life Expectancy" -->
+<!--        0.812, # , "Feelings of Freedom" -->
+<!--        0.072, # , "GNI per capita" -->
+<!--        0.273, # , "People in Cities" -->
+<!--        0.056, # , "Military Spending" -->
+<!--        1.624, # , "Strong Relationships" -->
+<!--        0.201, # , "LGBTQ+ Acceptance" -->
+<!--        0.349, # , "Access to Electricity" -->
+<!--        0.210, # , "Clean Water" -->
+<!--        -.125, # , "Unemployment" -->
+<!--        # -->
+<!--        (.036 + .039), # Accessible Political Power -->
+<!--        # , "No Election Interference": -.036 -->
+<!--        # , "Public Campaign Financing": .039 -->
+<!--        # -->
+<!--        (.076 + .119), # Good Information Access -->
+<!--        # , "Compulsory Education": .076 -->
+<!--        # , "Internet Users":      0.119 -->
+<!--        # -->
+<!--        (.071 + .074 + .042), # Meaningful Political Power -->
+<!--        # , "No Shadow Governance":    .071 -->
+<!--        # , "Party Shadow Governance":-.074 -->
+<!--        # , "Legislative Independence" .042 -->
+<!--        # -->
+<!--        (.031 + .038) # Gender Equity -->
+<!--        # , "Women in White Collar Jobs": .031 -->
+<!--        # , "Intimate Partner Violence": -.038 -->
+<!--     ) -->
+<!-- ) -->
+<!-- money$contribution <- 100 * (money$val / sum(abs(money$val))) # normalize to get %, not bx -->
+<!-- money$variable <- factor(money$variable, levels=money$variable[order(money$val)]) -->
+<!-- colorix <- as.integer((money$val > 0) + 1) -->
+<!-- money$group <- c("red", "skyblue")[colorix] -->
+
+<!-- p <- ggplot(money, aes(x=variable, y=contribution)) + -->
+<!--     geom_bar(stat = "identity", show.legend=F, fill=money$group) + # 'fill' in HERE -->
+<!--     coord_flip() + -->
+<!--     xlab("") + -->
+<!--     ylab("% contribution") -->
+<!-- p -->
+<!-- ``` -->
+
+<!-- Figure \ref{fig:summarizedresults}: Summarized Results of the Dovecote Model. These results are based on the quantities shown in \ref{fig:mbx}, but components with highly similar mearning are added together for easier interpretability. When the signs of added components differ, the sum is of their absolute values. Quantities created by grouping variables in this manner are indicated by an asterisk. -->
+
+
+<!-- ## The relevance of SDO and RWA to the model variables -->
+
+<!-- ### Strong relationships -->
+<!-- Strong social relationships cannot be relied upon from individuals high in SDO, which follows -->
+<!-- a law-of-the-jungle style of individualism. While individuals are not completely -->
+<!-- antisocial, they exhibit a high favoritism for only those who they perceive to be -->
+<!-- high-status [@SDOFavoritism]. -->
+
+<!-- ### Gay and lesbian acceptance -->
+<!-- Gay and lesbian acceptance (the original name of the variable in the data) -->
+<!-- conflicts with SDO through the fact that LGBTQ+ -->
+<!-- individuals are frequently discriminated against, meaning they are often considered -->
+<!-- lower status [@GayStatus]. Acceptance typically conflicts with RWA -->
+<!-- through RWA's strong bias towards cultural conventionalism in places -->
+<!-- where LGBTQ+ individuals are not widely accepted [@RWAGay]. -->
+
+<!-- ### Feelings of freedom -->
+<!-- Feelings of freedom conflicts strongly with RWA, as this freedom is necessarily at the expense of the -->
+<!-- control of the chosen authority, and the enforced uniformity of behavior by the followers. Robert Altemeyer, who developed the theory of -->
+<!-- RWA and remained its chief expert for decades, went so far as to -->
+<!-- title one of his books on the subject *Enemies of freedom: Understanding right-wing authoritarianism.* -->
+<!-- [@EnemiesOfFreedom]. It conflicts with SDO in that the perceived lower tiers -->
+<!-- are not considered important enough to deserve the same levels of power as the higher tiers. -->
+
+<!-- ### Shadow government -->
+<!-- We believe a similar pattern is at play in the two variables on shadow government, and in the ability of the legislature to control its own funds. They indicate that the people who actually hold power are not those who are supposed to, according to the structure of the political system. -->
+<!-- Not having a shadow government conflicts strongly with SDO, where individuals -->
+<!-- strive to take control under all circumstances. In a series of experiments, -->
+<!-- participants high in SDO voluntarily assumed power at rates two times -->
+<!-- higher than individuals low in SDO, and four times higher than authoritarian -->
+<!-- followers, who are individuals high in only RWA [@RWA]. The high SDO participants also -->
+<!-- effectively usurped power from the formally -->
+<!-- established authorities when power was not given to them through formal channels. -->
+<!-- What's more, attempting to create an un-elected government by -->
+<!-- capturing the judiciary is a standard, well-recognized, and effective tactic of -->
+<!-- authoritarians [@HDD]. -->
+
+<!-- ### Inclusive power -->
+<!-- The category of Inclusive Power conflicts with the behaviors of both SDO and RWA. Power for women and public funding for election campaigns democratize power in a way that is directly threatening to both established authorities and hierarchies [@Sexism], [@VotingViews]. The ruling party interfering in local elections is clearly in the opposite direction -- an attempt to keep power within a small chosen group. -->
+
+<!-- ### Education and information -->
+<!-- Compulsory years of education conflicts with the extreme information -->
+<!-- control inherent to high-RWA systems such as fundamentalist religions [@RWA]. -->
+<!-- A successful education also conflicts with the behavior described by -->
+<!-- research findings that individuals high in RWA are less likely to update -->
+<!-- their beliefs when presented with conflicting information [@BadThinking]. -->
+<!-- While it is clear that the internet contains large amounts of both accurate and -->
+<!-- innaccurate information, and that the sign of the variable was unstable, it -->
+<!-- does strongly suggest that information access is key to life satisfaction, and RWA is -->
+<!-- highly correlated with information access, exposure, and acceptance. -->
+
+<!-- ### Unemployment -->
+<!-- The variable on unemployment represents a group of people with limited amounts -->
+<!-- of power. SDO is defined by a -->
+<!-- belief that such power differentials are morally right, and should be maintained. -->
+<!-- These beliefs are consistent even for circumstances over which the sufferer -->
+<!-- has no control, such as mental illness [@SDOMentalIllness], and so conflict with -->
+<!-- care for the unemployed. -->
+
+<!-- ### People in cities -->
+<!-- While cities are inherently complex, and expose inhabitants to an enormous number of -->
+<!-- different variables, one of the most distinct is racial, social, class, and -->
+<!-- other diversity. Studies of college students have shown that the RWA level of high-RWA -->
+<!-- freshmen is substantially reduced with extended exposure to higher education [@RWA]. -->
+<!-- The effect is hypothesized to be a result of access, possibly for the first time, -->
+<!-- to people and information that do not fit into previous, highly curated, experiences, -->
+<!-- attenuating the harsh and unfounded criticism of these previously foreign groups. -->
+<!-- Cities are hypothesized to have a similar effect, through a similar mechanism. -->
+<!-- It also is notable that cities are frequently denounced as immoral, dangerous, and -->
+<!-- even taboo by high RWA communities [@CitiesAreEvil]. -->
+
+<!-- ### Military spending per capita -->
+<!-- This is the single variable that appears to support SDO and RWA behavior, which -->
+<!-- is quick to glorify and employ physical violence [@RWA]. Once conceptually -->
+<!-- similar variables have been grouped (such as the multiple variables on shadow -->
+<!-- governance), military spending is also arguably the single smallest variable of the nineteen. -->
+
+<!-- ### Water, electricity, lifespan, and GNI -->
+<!-- Only the variables on such simple needs as clean water, electricity, -->
+<!-- life expectancy, and GNI do not have obvious immediate connections to RWA and SDO. However, -->
+<!-- the combination of the two traits produces a profile that is -->
+<!-- strongly resistant to undesirable facts, and without any interest in actions that -->
+<!-- do not produce personal benefit. In resource management studies, the worst outcomes -->
+<!-- were reliably produced by teams with these "double high" individuals [@GCG], -->
+<!-- strongly suggesting this is not a profile that can be expected to -->
+<!-- carefully or effectively manage even such basic policy areas. -->
+
+<!-- ### Immigration -->
+<!-- While immigration is not chosen by the search procedure, and has almost zero -->
+<!-- explanatory power even when forced into the model, we believe this finding is -->
+<!-- significant on its own because of the consistent and extraordinary effort of authoritarian -->
+<!-- regimes to blame a country's problems on immigration. We find no evidence whatsoever -->
+<!-- that it has any effect at all on national life satisfaction. -->
+
+<!-- ## Dataset locations -->
+
+<!-- ### Public -->
+
+<!-- https://worldhappiness.report/data/ -->
+
+<!-- https://v-dem.net/data/the-v-dem-dataset/country-year-v-dem-fullothers-v13/ -->
+
+<!-- https://databank.worldbank.org/source/world-development-indicators/Series/SL.UEM.TOTL.ZS# -->
+
+<!-- https://data.worldbank.org/indicator/SM.POP.NETM -->
+
+<!-- https://dashboards.sdgindex.org/static/downloads/files/SDR2023-data.xlsx -->
+
+<!-- https://unstats.un.org/sdgs/dataportal -->
+
+<!-- https://www.sipri.org/databases/milex -->
+
+<!-- ### Commercial -->
+
+<!-- https://www.socialprogress.org/premium-tools/ -->
+
+
+    
+    
+    
